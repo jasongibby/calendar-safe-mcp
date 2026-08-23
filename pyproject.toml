@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "calendar-safe-mcp"
+version = "0.1.0"
+description = "A lean Apple Calendar MCP server built on EventKit"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+keywords = ["apple-calendar", "eventkit", "mcp"]
+classifiers = [
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+]
+dependencies = [
+  "mcp>=1.2,<2",
+  "pyobjc-framework-EventKit>=11,<12",
+]
+
+[project.scripts]
+calendar-safe-mcp = "calendar_safe_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/calendar_safe_mcp"]
