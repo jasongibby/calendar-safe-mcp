@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import warnings
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from threading import Semaphore
@@ -21,20 +22,22 @@ from EventKit import (
     EKSpanFutureEvents,
     EKSpanThisEvent,
 )
-
-warnings.filterwarnings("ignore", message="Field 'lifespan' has an incomplete definition.*")
-
 from mcp.server.fastmcp import FastMCP
 
-
-mcp = FastMCP("Apple Calendar (safe)")
+with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", message="Field 'lifespan' has an incomplete definition.*")
+    mcp = FastMCP("Apple Calendar (safe)")
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="eventkit")
 _manager: CalendarManager | None = None
 MAX_EVENT_RANGE = timedelta(days=366)
 
 
 def _iso(value: Any) -> str:
-    return datetime.fromtimestamp(value.timeIntervalSince1970()).astimezone().isoformat(timespec="seconds")
+    return (
+        datetime.fromtimestamp(value.timeIntervalSince1970())
+        .astimezone()
+        .isoformat(timespec="seconds")
+    )
 
 
 def _native_date(value: datetime) -> datetime:
@@ -63,9 +66,25 @@ def _serialize_event(event: Any, include_details: bool = False) -> dict[str, Any
         result.update(
             notes=event.notes() or None,
             url=str(event_url) if event_url else None,
-            alarms_minutes_before=[int(-alarm.relativeOffset() / 60) for alarm in (event.alarms() or [])],
+            alarms_minutes_before=[
+                int(-alarm.relativeOffset() / 60) for alarm in (event.alarms() or [])
+            ],
         )
     return result
+
+
+def _validate_dates(start: datetime, end: datetime, *, limited: bool = False) -> None:
+    if end <= start:
+        raise ValueError("end must be after start")
+    if limited and end - start > MAX_EVENT_RANGE:
+        raise ValueError("event ranges cannot exceed 366 days; request a smaller window")
+
+
+def _validate_fields(title: str | None, alarms: list[int] | None) -> None:
+    if title is not None and not title.strip():
+        raise ValueError("title must not be empty")
+    if alarms is not None and any(minutes < 0 for minutes in alarms):
+        raise ValueError("alarm offsets must be non-negative")
 
 
 class CalendarManager:
@@ -80,7 +99,9 @@ class CalendarManager:
         if status == EKAuthorizationStatusRestricted:
             raise PermissionError("Calendar access is restricted by macOS policy")
         if status == EKAuthorizationStatusDenied:
-            raise PermissionError("Calendar access was denied; enable Full Access in System Settings")
+            raise PermissionError(
+                "Calendar access was denied; enable Full Access in System Settings"
+            )
 
         semaphore = Semaphore(0)
         outcome: dict[str, Any] = {"granted": False, "error": None}
@@ -113,15 +134,14 @@ class CalendarManager:
         return matches[0]
 
     def events(self, start: datetime, end: datetime, calendar_names: list[str] | None) -> list[Any]:
-        if end <= start:
-            raise ValueError("end must be after start")
-        if end - start > MAX_EVENT_RANGE:
-            raise ValueError("event ranges cannot exceed 366 days; request a smaller window")
+        _validate_dates(start, end, limited=True)
         calendars = [self.calendar(name) for name in calendar_names] if calendar_names else None
         predicate = self.store.predicateForEventsWithStartDate_endDate_calendars_(
             _native_date(start), _native_date(end), calendars
         )
-        return sorted(self.store.eventsMatchingPredicate_(predicate), key=lambda event: event.startDate())
+        return sorted(
+            self.store.eventsMatchingPredicate_(predicate), key=lambda event: event.startDate()
+        )
 
     def event(self, occurrence_id: str) -> Any:
         try:
@@ -130,11 +150,14 @@ class CalendarManager:
         except (ValueError, TypeError) as error:
             raise ValueError("Use the occurrence ID returned by list_events") from error
 
-        for event in self.events(occurrence - timedelta(seconds=1), occurrence + timedelta(seconds=1), None):
+        for event in self.events(
+            occurrence - timedelta(seconds=1), occurrence + timedelta(seconds=1), None
+        ):
             event_occurrence = event.occurrenceDate() or event.startDate()
-            if event.eventIdentifier() == identifier and abs(
-                event_occurrence.timeIntervalSince1970() - occurrence.timestamp()
-            ) < 1:
+            if (
+                event.eventIdentifier() == identifier
+                and abs(event_occurrence.timeIntervalSince1970() - occurrence.timestamp()) < 1
+            ):
                 return event
         raise ValueError("Calendar event was not found; refresh it with list_events")
 
@@ -146,23 +169,27 @@ def _get_manager() -> CalendarManager:
     return _manager
 
 
-async def _eventkit(method: str, *args: Any) -> Any:
+async def _eventkit(operation: Callable[[CalendarManager], Any]) -> Any:
+    """Keep store access, event mutations, and serialization on the same thread."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_executor, lambda: getattr(_get_manager(), method)(*args))
+    return await loop.run_in_executor(_executor, lambda: operation(_get_manager()))
 
 
 @mcp.tool()
 async def list_calendars() -> str:
     """List calendars and whether each permits event changes."""
-    calendars = await _eventkit("calendars")
-    result = [
-        {
-            "name": calendar.title(),
-            "id": calendar.calendarIdentifier(),
-            "writable": bool(calendar.allowsContentModifications()),
-        }
-        for calendar in sorted(calendars, key=lambda item: item.title().casefold())
-    ]
+
+    def read(manager: CalendarManager) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": calendar.title(),
+                "id": calendar.calendarIdentifier(),
+                "writable": bool(calendar.allowsContentModifications()),
+            }
+            for calendar in sorted(manager.calendars(), key=lambda item: item.title().casefold())
+        ]
+
+    result = await _eventkit(read)
     return json.dumps({"calendars": result}, ensure_ascii=False)
 
 
@@ -179,24 +206,27 @@ async def list_events(
     """Read events in a range. Details are excluded unless explicitly requested."""
     if not 1 <= limit <= 1000:
         raise ValueError("limit must be between 1 and 1000")
-    events = await _eventkit("events", start, end, calendar_names)
-    if query:
-        needle = query.casefold()
-        events = [
-            event
-            for event in events
-            if needle in (event.title() or "").casefold()
-            or (search_notes and needle in (event.notes() or "").casefold())
-        ]
-    total = len(events)
-    return json.dumps(
-        {
+    _validate_dates(start, end, limited=True)
+
+    def read(manager: CalendarManager) -> dict[str, Any]:
+        events = manager.events(start, end, calendar_names)
+        if query:
+            needle = query.casefold()
+            events = [
+                event
+                for event in events
+                if needle in (event.title() or "").casefold()
+                or (search_notes and needle in (event.notes() or "").casefold())
+            ]
+        total = len(events)
+        return {
             "events": [_serialize_event(event, include_details) for event in events[:limit]],
             "total": total,
             "truncated": total > limit,
-        },
-        ensure_ascii=False,
-    )
+        }
+
+    result = await _eventkit(read)
+    return json.dumps(result, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -212,10 +242,8 @@ async def create_event(
     alarms_minutes_before: list[int] | None = None,
 ) -> str:
     """Create one non-recurring event through EventKit."""
-    if not title.strip():
-        raise ValueError("title must not be empty")
-    if end <= start:
-        raise ValueError("end must be after start")
+    _validate_fields(title, alarms_minutes_before)
+    _validate_dates(start, end)
 
     def create(manager: CalendarManager) -> Any:
         calendar = manager.calendar(calendar_name)
@@ -236,17 +264,14 @@ async def create_event(
 
             event.setURL_(NSURL.URLWithString_(url))
         for minutes in alarms_minutes_before or []:
-            if minutes < 0:
-                raise ValueError("alarm offsets must be non-negative")
             event.addAlarm_(EKAlarm.alarmWithRelativeOffset_(-60 * minutes))
         success, error = manager.store.saveEvent_span_error_(event, EKSpanThisEvent, None)
         if not success:
             raise RuntimeError(f"EventKit could not save the event: {error}")
-        return event
+        return _serialize_event(event)
 
-    loop = asyncio.get_running_loop()
-    event = await loop.run_in_executor(_executor, lambda: create(_get_manager()))
-    return json.dumps({"event": _serialize_event(event)}, ensure_ascii=False)
+    event = await _eventkit(create)
+    return json.dumps({"event": event}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -264,26 +289,37 @@ async def update_event(
     span: Literal["this", "future"] | None = None,
 ) -> str:
     """Update an occurrence. Recurring events require span=this or span=future."""
+    _validate_fields(title, alarms_minutes_before)
+    if span not in {None, "this", "future"}:
+        raise ValueError("span must be this or future")
 
     def update(manager: CalendarManager) -> Any:
         event = manager.event(id)
         recurring = bool(event.hasRecurrenceRules())
         if recurring and span is None:
-            raise ValueError("Recurring events require span='this' or span='future'; no default is safe")
+            raise ValueError(
+                "Recurring events require span='this' or span='future'; no default is safe"
+            )
+        start_time = (
+            start.timestamp() if start is not None else event.startDate().timeIntervalSince1970()
+        )
+        end_time = end.timestamp() if end is not None else event.endDate().timeIntervalSince1970()
+        if end_time <= start_time:
+            raise ValueError("end must be after start")
+        calendar = (
+            manager.calendar(calendar_name) if calendar_name is not None else event.calendar()
+        )
+        if not calendar.allowsContentModifications():
+            raise ValueError(f"Calendar is read-only: {calendar.title()}")
+
+        # Validate dates and the destination before changing the cached EventKit object.
         if title is not None:
-            if not title.strip():
-                raise ValueError("title must not be empty")
             event.setTitle_(title)
         if start is not None:
             event.setStartDate_(_native_date(start))
         if end is not None:
             event.setEndDate_(_native_date(end))
-        if event.endDate().timeIntervalSince1970() <= event.startDate().timeIntervalSince1970():
-            raise ValueError("end must be after start")
         if calendar_name is not None:
-            calendar = manager.calendar(calendar_name)
-            if not calendar.allowsContentModifications():
-                raise ValueError(f"Calendar is read-only: {calendar.title()}")
             event.setCalendar_(calendar)
         if all_day is not None:
             event.setAllDay_(all_day)
@@ -296,18 +332,20 @@ async def update_event(
 
             event.setURL_(NSURL.URLWithString_(url) if url else None)
         if alarms_minutes_before is not None:
-            if any(minutes < 0 for minutes in alarms_minutes_before):
-                raise ValueError("alarm offsets must be non-negative")
-            event.setAlarms_([EKAlarm.alarmWithRelativeOffset_(-60 * minutes) for minutes in alarms_minutes_before])
+            event.setAlarms_(
+                [
+                    EKAlarm.alarmWithRelativeOffset_(-60 * minutes)
+                    for minutes in alarms_minutes_before
+                ]
+            )
         event_span = EKSpanFutureEvents if span == "future" else EKSpanThisEvent
         success, error = manager.store.saveEvent_span_error_(event, event_span, None)
         if not success:
             raise RuntimeError(f"EventKit could not update the event: {error}")
-        return event
+        return _serialize_event(event)
 
-    loop = asyncio.get_running_loop()
-    event = await loop.run_in_executor(_executor, lambda: update(_get_manager()))
-    return json.dumps({"event": _serialize_event(event)}, ensure_ascii=False)
+    event = await _eventkit(update)
+    return json.dumps({"event": event}, ensure_ascii=False)
 
 
 def main() -> None:
